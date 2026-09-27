@@ -1,0 +1,101 @@
+Часть 2 — «Сервис за reverse proxy с TLS» (М4, до 9 баллов) — Капстоун, финал
+0. Прежде чем проксировать: контейнер должен что-то слушать
+Контейнер из Части 1 запусою работу (собирает лог / пишет мониторинг / создаёт пользователя) и на этом завершается или крутится в фоне — но ничего не слушает по сети. Reverse proxy умеет проксировать только на то, что реально принимает TCP-соединения на порту 8080; без этого шага docker run -d -p 8080:8080 поднимет контейнер, docker ps покажет его как Up, но curl получит Connection refused — контейнер жив, а слушателя порта в нём нет.
+
+В Dockerfile поверх скрипта добавляется минимальный HTTP-сервер, который отдаёт содержимое рабочей директории — то есть результат работы script.sh (report.txt, monitor.log или другие создаваемые им файлы):
+
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /var/www
+COPY script.sh /usr/local/bin/script.sh
+RUN chmod +x /usr/local/bin/script.sh
+CMD ["/bin/bash", "-c", "/usr/local/bin/script.sh & exec python3 -m http.server 8080"]
+(вариант В по умолчанию ждёт аргумент с именем пользователя — если выбрали его, передайте аргумент явно: CMD ["/bin/bash", "-c", "/usr/local/bin/script.sh demo-user & exec python3 -m http.server 8080"])
+
+Пересоберите образ — docker build -t my-script . — с этого момента контейнер не завершается, а слушает 8080 и отдаёт файлы своей рабочей директории (curl http://127.0.0.1:8080/monitor.log покажет вывод скрипта прямо через HTTP, ещё до Nginx).
+
+1. Запустить контейнер на порту 8080
+docker run -d -p 8080:8080 --name my-app my-script
+2. Установить и настроить Nginx как reverse proxy
+sudo apt install -y nginx
+sudo nano /etc/nginx/sites-available/my-app
+Конфиг обязательно оборачивается в блок server { ... } — файлы sites-enabled подключаются в контекст http, где голая директива location без окружающего server не пройдёт проверку:
+
+server {
+    listen 80;
+    server_name _;
+ 
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+sudo ln -s /etc/nginx/sites-available/my-app /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo nginx -t должен вывести syntax is ok и test is successful — не переходите к следующему шагу, пока не увидите именно это.
+
+3. TLS (self-signed для учебной среды)
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/my-app.key \
+  -out /etc/ssl/certs/my-app.crt \
+  -subj "/CN=my-app.local"
+Обновите конфиг — HTTP-порт редиректит на HTTPS, а не просто «перестаёт отвечать» после появления TLS-блока:
+
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+ 
+server {
+    listen 443 ssl;
+    server_name _;
+ 
+    ssl_certificate     /etc/ssl/certs/my-app.crt;
+    ssl_certificate_key /etc/ssl/private/my-app.key;
+ 
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+    }
+}
+sudo nginx -t && sudo systemctl reload nginx
+4. Systemd-служба для контейнера
+sudo nano /etc/systemd/system/my-app.service
+Каждая директива — на своей строке (в systemd это не проза, а формат .ini):
+
+[Unit]
+Description=my-app service
+After=docker.service
+Requires=docker.service
+ 
+[Service]
+ExecStart=docker start -a my-app
+Restart=on-failure
+ 
+[Install]
+WantedBy=multi-user.target
+sudo systemctl daemon-reload
+sudo systemctl enable my-app
+sudo systemctl start my-app
+sudo systemctl status my-app     # должен быть active (running)
+After=/Requires=docker.service — не декоративные строки: без них служба может стартовать раньше самого Docker при перезагрузке машины, и тогда docker start упадёт в момент, когда демон ещё не поднялся.
+
+5. Наблюдаемость
+sudo journalctl -u my-app -f # логи сервиса, Ctrl+C для выхода
+sudo tail -f /var/log/nginx/access.log  # HTTP-запросы в реальном времени
+Откройте второй терминал (или новую сессию) и выполните curl -kI https://<адрес-машины> — в первом терминале должен появиться соответствующий запрос в access.log.
+
+Что сдавать (часть 2)
+Вывод sudo nginx -t (успешный), curl -kI https://<host> с кодом 200, systemctl status my-app (active), и снимок journalctl -u my-app сразу после тестового запроса.
+
+$ curl -kI https://192.168.64.5
+HTTP/2 200
+server: nginx/1.24.0
+...
+(флаг -k отключает проверку сертификата — ожидаемо для самоподписанного, в проде так делать нельзя)
+
+Рубрика части 2
+Критерий	0	1–2	3
+Контейнер запущен, доступен на localhost:8080	Нет	Запускается с ошибками	Да
+Nginx настроен как reverse proxy, nginx -t проходит	Нет	Конфиг есть, ошибки	Да
+TLS (self-signed или Let's Encrypt) настрое

@@ -1,0 +1,6 @@
+services:
+  monitor:
+    build: .
+    container_name: my-sysadmin-container
+    volumes:
+      - ./monitor.log:/app/monitor.log
